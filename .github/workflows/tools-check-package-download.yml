@@ -1,0 +1,113 @@
+name: "z: Check package download"
+
+on:
+  schedule:
+    # Run weekly on Sundays at 02:00 UTC
+    - cron: "0 2 * * 0"
+  workflow_dispatch:
+    inputs:
+      PACKAGE_SCOPE:
+        description: "Package scope to check"
+        required: true
+        type: choice
+        default: "core"
+        options:
+          - "core"
+          - "addons"
+          - "all"
+      BASE_BRANCH:
+        description: "LibreELEC.tv branch to check"
+        required: false
+        default: "master"
+      PRIMARY_ONLY:
+        description: "Test upstream primary URL only (do not fall back to LibreELEC mirror)"
+        required: true
+        type: boolean
+        default: true
+      PACKAGE_FILTER:
+        description: "Optional package filter pattern (e.g. 'zlib' or 'kodi*'); leave empty to check all in scope"
+        required: false
+        default: ""
+
+jobs:
+  check-packages:
+    name: "Check (Shard ${{ matrix.shard }}/8)"
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - name: Checkout actions repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          path: actions
+
+      - name: Checkout LibreELEC.tv
+        uses: actions/checkout@v6
+        with:
+          repository: LibreELEC/LibreELEC.tv
+          ref: ${{ github.event.inputs.BASE_BRANCH || 'master' }}
+          fetch-depth: 1
+          path: LibreELEC.tv
+
+      - name: Run package download & hash check
+        shell: bash
+        env:
+          PACKAGE_SCOPE: ${{ github.event.inputs.PACKAGE_SCOPE || 'core' }}
+          PRIMARY_ONLY: ${{ github.event.inputs.PRIMARY_ONLY || 'true' }}
+          PACKAGE_FILTER: ${{ github.event.inputs.PACKAGE_FILTER || '' }}
+        run: |
+          mkdir -p shard-results
+          python3 actions/scripts/check_package_download.py \
+            --le-dir LibreELEC.tv \
+            --scope "${PACKAGE_SCOPE}" \
+            --shard ${{ matrix.shard }} \
+            --total-shards 8 \
+            --primary-only "${PRIMARY_ONLY}" \
+            --filter "${PACKAGE_FILTER}" \
+            --output-json "shard-results/shard_${{ matrix.shard }}.json"
+
+      - name: Upload shard results
+        uses: actions/upload-artifact@v7
+        with:
+          name: shard-result-${{ matrix.shard }}
+          path: shard-results/shard_${{ matrix.shard }}.json
+          retention-days: 7
+
+  aggregate-report:
+    name: "Aggregate Report & Summary"
+    needs: check-packages
+    runs-on: ubuntu-24.04
+    if: always()
+    steps:
+      - name: Checkout actions repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          path: actions
+
+      - name: Download all shard results
+        uses: actions/download-artifact@v8
+        with:
+          path: shard-results
+          pattern: shard-result-*
+          merge-multiple: true
+
+      - name: Generate summary report
+        shell: bash
+        run: |
+          python3 actions/scripts/check_package_download.py \
+            --aggregate-dir shard-results \
+            --summary-file "${GITHUB_STEP_SUMMARY}" \
+            --output-md package_download_report.md \
+            --fail-on-errors
+
+      - name: Upload full report artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: package-download-report
+          path: package_download_report.md
+          retention-days: 30
